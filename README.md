@@ -2,9 +2,10 @@
 
 ![BubbleEater banner](store-assets/banner-720x320.png)
 
-A bubble-eating arcade game for the **Pebble Time 2** (emery), controlled
-entirely by tilting the watch (IMU/accelerometer). Eat smaller bubbles, dodge
-bigger ones, grow to rule the arena.
+A bubble-eating arcade game for **every Pebble watch** — aplite, basalt,
+chalk, diorite, emery, flint, and gabbro — controlled entirely by tilting the
+watch (IMU/accelerometer). Eat smaller bubbles, dodge bigger ones, grow to
+rule the arena.
 
 | Action | Feeding | Game over |
 |---|---|---|
@@ -15,7 +16,8 @@ bigger ones, grow to rule the arena.
 - Tilt the watch to steer your bubble (cyan) around a 600×600 world.
 - Eat yellow food pellets and smaller bubbles to grow. Bigger = slower.
 - Enemy bubbles are colored by threat: **red** can eat you, **green** you can
-  eat, **gray** is too close in size for either.
+  eat, **gray** is too close in size for either. On black & white watches:
+  solid means danger, hollow means edible, and your own bubble has a dark core.
 - Enemies hunt food, chase you when you're edible, and flee when you're the
   threat. A bubble must be mostly engulfed before it's eaten — grazing a red
   bubble won't kill you.

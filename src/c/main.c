@@ -365,9 +365,10 @@ static void draw_hud(GContext *ctx) {
   static char buf[24];
   snprintf(buf, sizeof(buf), "Score: %d", s_score);
   graphics_context_set_text_color(ctx, GColorWhite);
+  // Centered on round displays so the circular bezel doesn't clip it.
   graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
                      GRect(4, 0, PBL_DISPLAY_WIDTH - 8, 22), GTextOverflowModeTrailingEllipsis,
-                     GTextAlignmentLeft, NULL);
+                     PBL_IF_ROUND_ELSE(GTextAlignmentCenter, GTextAlignmentLeft), NULL);
 }
 
 static void draw_center_text(GContext *ctx, const char *line1, const char *line2) {
@@ -386,7 +387,7 @@ static void game_layer_update(Layer *layer, GContext *ctx) {
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
   // Grid for a sense of motion.
-  graphics_context_set_stroke_color(ctx, GColorDarkGray);
+  graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorWhite));
   for (int gx = -(s_cam_x % 50); gx < PBL_DISPLAY_WIDTH; gx += 50) {
     graphics_draw_line(ctx, GPoint(gx, 0), GPoint(gx, PBL_DISPLAY_HEIGHT));
   }
@@ -399,7 +400,7 @@ static void game_layer_update(Layer *layer, GContext *ctx) {
   graphics_draw_rect(ctx, GRect(-s_cam_x, -s_cam_y, WORLD_W, WORLD_H));
 
   // Food.
-  graphics_context_set_fill_color(ctx, GColorYellow);
+  graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorYellow, GColorWhite));
   for (int i = 0; i < FOOD_COUNT; i++) {
     if (!s_food[i].alive) {
       continue;
@@ -422,6 +423,7 @@ static void game_layer_update(Layer *layer, GContext *ctx) {
         p.y > PBL_DISPLAY_HEIGHT + e->r) {
       continue;
     }
+#ifdef PBL_COLOR
     GColor fill;
     if (can_eat(e->r, s_player.r)) {
       fill = GColorRed;
@@ -434,15 +436,34 @@ static void game_layer_update(Layer *layer, GContext *ctx) {
     graphics_fill_circle(ctx, p, e->r);
     graphics_context_set_stroke_color(ctx, GColorWhite);
     graphics_draw_circle(ctx, p, e->r);
+#else
+    // BW threat language: dangerous = solid, edible = hollow,
+    // near-equal = hollow with a center dot.
+    graphics_context_set_stroke_color(ctx, GColorWhite);
+    if (can_eat(e->r, s_player.r)) {
+      graphics_context_set_fill_color(ctx, GColorWhite);
+      graphics_fill_circle(ctx, p, e->r);
+    } else if (can_eat(s_player.r, e->r)) {
+      graphics_draw_circle(ctx, p, e->r);
+    } else {
+      graphics_draw_circle(ctx, p, e->r);
+      graphics_context_set_fill_color(ctx, GColorWhite);
+      graphics_fill_circle(ctx, p, e->r > 6 ? 3 : 1);
+    }
+#endif
   }
 
-  // Player.
+  // Player: on BW a black core distinguishes it from solid (dangerous) enemies.
   if (s_player.alive) {
     GPoint p = GPoint(TO_PX(s_player.x) - s_cam_x, TO_PX(s_player.y) - s_cam_y);
-    graphics_context_set_fill_color(ctx, GColorCyan);
+    graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorCyan, GColorWhite));
     graphics_fill_circle(ctx, p, s_player.r);
     graphics_context_set_stroke_color(ctx, GColorWhite);
     graphics_draw_circle(ctx, p, s_player.r);
+#ifndef PBL_COLOR
+    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_fill_circle(ctx, p, s_player.r / 3);
+#endif
   }
 
   draw_hud(ctx);
