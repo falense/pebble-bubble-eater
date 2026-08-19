@@ -43,6 +43,10 @@ pebble sdk install latest
 pebble build
 ```
 
+> Note: after changing app metadata in `package.json` (version, platforms,
+> etc.), run `pebble clean` first — the build caches the generated
+> `appinfo.json` and won't pick up the change otherwise.
+
 ## Running in the emulator
 
 ```bash
