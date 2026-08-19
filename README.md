@@ -9,7 +9,7 @@ rule the arena.
 
 | Action | Feeding | Game over |
 |---|---|---|
-| ![Gameplay](store-assets/screenshot-1-action.png) | ![Feeding](store-assets/screenshot-2-feeding.png) | ![Game over](store-assets/screenshot-4-gameover.png) |
+| ![Gameplay](store-assets/emery/screenshot-1-action.png) | ![Feeding](store-assets/emery/screenshot-2-feeding.png) | ![Game over](store-assets/emery/screenshot-4-gameover.png) |
 
 ## Gameplay
 
