@@ -1,0 +1,13 @@
+# Pebble build output
+build/
+.lock-waf_*
+
+# Claude Code local state
+.claude/
+.transcripts/
+.memories/
+.tmp/
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,23 @@
+{
+  "name": "bubbleeater",
+  "author": "Sondre Engebråten",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "BubbleEater",
+    "uuid": "cfea6991-5381-4af3-8c33-488e4dd8a5df",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "emery"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "resources": {
+      "media": []
+    }
+  }
+}
