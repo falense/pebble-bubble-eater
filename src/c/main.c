@@ -352,9 +352,16 @@ static void game_tick(void *context) {
   }
   resolve_eating();
 
-  // Camera follows the player, clamped to the world.
+  // Camera follows the player. On round displays it stays centered on the
+  // player unconditionally — clamping to the world edge would push the
+  // player into a corner the circular bezel clips away.
+#ifdef PBL_ROUND
+  s_cam_x = TO_PX(s_player.x) - PBL_DISPLAY_WIDTH / 2;
+  s_cam_y = TO_PX(s_player.y) - PBL_DISPLAY_HEIGHT / 2;
+#else
   s_cam_x = clamp32(TO_PX(s_player.x) - PBL_DISPLAY_WIDTH / 2, 0, WORLD_W - PBL_DISPLAY_WIDTH);
   s_cam_y = clamp32(TO_PX(s_player.y) - PBL_DISPLAY_HEIGHT / 2, 0, WORLD_H - PBL_DISPLAY_HEIGHT);
+#endif
 
   layer_mark_dirty(s_game_layer);
 }
