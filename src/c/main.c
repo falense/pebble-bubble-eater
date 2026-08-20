@@ -18,6 +18,9 @@
 
 #define FOOD_COUNT 36
 #define FOOD_RADIUS 2
+// Food is worth more area than its drawn size (as if r=5) so growth is
+// snappy early and tapers naturally as the bubble gets bigger.
+#define FOOD_VALUE 25
 #define ENEMY_COUNT 6
 
 #define PLAYER_START_RADIUS 8
@@ -43,8 +46,9 @@ typedef enum {
 } GameState;
 
 typedef struct {
-  int32_t x, y;  // fixed point, world coordinates
-  int16_t r;     // radius in px
+  int32_t x, y;   // fixed point, world coordinates
+  int32_t mass;   // area in px²; source of truth for size
+  int16_t r;      // radius in px, derived from mass
   bool alive;
 } Cell;
 
@@ -120,10 +124,11 @@ static bool engulfs(const Cell *eater, const Cell *prey) {
   return within_dist(eater->x, eater->y, prey->x, prey->y, eater->r - prey->r / 3);
 }
 
-static int16_t grow_radius(int16_t r, int16_t eaten_r) {
-  int32_t r2 = (int32_t)r * r + (int32_t)eaten_r * eaten_r;
-  int32_t nr = isqrt32(r2);
-  return (int16_t)clamp32(nr, 1, MAX_RADIUS);
+// Growth accumulates in mass (area) so small meals aren't lost to integer
+// radius truncation; the px radius is derived on every change.
+static void grow(Cell *c, int32_t eaten_mass) {
+  c->mass = clamp32(c->mass + eaten_mass, 1, MAX_RADIUS * MAX_RADIUS);
+  c->r = (int16_t)isqrt32(c->mass);
 }
 
 // --- spawning ---------------------------------------------------------------
@@ -139,6 +144,7 @@ static void spawn_enemy(Cell *e) {
   int lo = (s_player.r * 4) / 10;
   int hi = (s_player.r * 12) / 10;
   e->r = (int16_t)clamp32(rand_range(lo, hi), 4, MAX_RADIUS);
+  e->mass = (int32_t)e->r * e->r;
 
   // Spawn away from the player so nothing materialises on top of them.
   int px = TO_PX(s_player.x);
@@ -165,6 +171,7 @@ static void game_reset(void) {
   s_player.x = TO_FP(WORLD_W / 2);
   s_player.y = TO_FP(WORLD_H / 2);
   s_player.r = PLAYER_START_RADIUS;
+  s_player.mass = PLAYER_START_RADIUS * PLAYER_START_RADIUS;
   s_player.alive = true;
   s_score = 0;
 
@@ -280,7 +287,7 @@ static void resolve_eating(void) {
     }
     if (touches_food(&s_player, &s_food[i])) {
       s_food[i].alive = false;
-      s_player.r = grow_radius(s_player.r, FOOD_RADIUS);
+      grow(&s_player, FOOD_VALUE);
       s_score += 1;
       spawn_food(&s_food[i]);
     }
@@ -297,7 +304,7 @@ static void resolve_eating(void) {
       }
       if (touches_food(&s_enemies[e], &s_food[i])) {
         s_food[i].alive = false;
-        s_enemies[e].r = grow_radius(s_enemies[e].r, FOOD_RADIUS);
+        grow(&s_enemies[e], FOOD_VALUE);
         spawn_food(&s_food[i]);
       }
     }
@@ -311,7 +318,7 @@ static void resolve_eating(void) {
     }
     if (can_eat(s_player.r, en->r) && engulfs(&s_player, en)) {
       s_score += en->r;
-      s_player.r = grow_radius(s_player.r, en->r);
+      grow(&s_player, en->mass);
       spawn_enemy(en);
     } else if (can_eat(en->r, s_player.r) && engulfs(en, &s_player)) {
       s_player.alive = false;
@@ -332,7 +339,7 @@ static void resolve_eating(void) {
         continue;
       }
       if (can_eat(s_enemies[a].r, s_enemies[b].r) && engulfs(&s_enemies[a], &s_enemies[b])) {
-        s_enemies[a].r = grow_radius(s_enemies[a].r, s_enemies[b].r);
+        grow(&s_enemies[a], s_enemies[b].mass);
         spawn_enemy(&s_enemies[b]);
       }
     }
