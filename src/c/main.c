@@ -110,6 +110,7 @@ static int16_t s_dash_ticks, s_dash_cd;
 static int16_t s_ghost_ticks, s_ghost_cd;
 static int16_t s_freeze_ticks, s_freeze_cd;
 static bool s_camo_hidden;
+static bool s_vamp_link[ENEMY_COUNT];  // enemy being siphoned this tick
 
 // Extra food spawned by Mitosis; does not respawn when eaten.
 #define MITOSIS_MAX 10
@@ -121,8 +122,9 @@ static Food s_mfood[MITOSIS_MAX];
 #define VIRUS_RADIUS 7
 static Food s_virus[VIRUS_MAX];
 
-// Trail: recent player positions in world px, ring buffer.
-#define TRAIL_MAX 24
+// Trail: recent player positions in world px, ring buffer. Recorded every
+// 2 ticks; the level caps how many points persist (60/90/120 ≈ 4/6/8 s).
+#define TRAIL_MAX 120
 static GPoint s_trail[TRAIL_MAX];
 static uint8_t s_trail_len, s_trail_head, s_trail_tick;
 
@@ -604,6 +606,10 @@ static void apply_magnet(void) {
 }
 
 static void resolve_eating(void) {
+  for (int e = 0; e < ENEMY_COUNT; e++) {
+    s_vamp_link[e] = false;
+  }
+
   // Player eats food.
   for (int i = 0; i < FOOD_COUNT; i++) {
     if (!s_food[i].alive) {
@@ -677,9 +683,10 @@ static void resolve_eating(void) {
                  within_dist(en->x, en->y, s_player.x, s_player.y, en->r + s_player.r)) {
         // Grazing (touching without being engulfed by) a bigger enemy
         // siphons its mass, tick by tick.
-        int32_t sip = 2 * upg_level(UPG_VAMPIRE);
+        int32_t sip = 6 * upg_level(UPG_VAMPIRE);
         grow(en, -sip);
         grow(&s_player, sip);
+        s_vamp_link[e] = true;
       }
     }
   }
@@ -749,12 +756,16 @@ static void game_tick(void *context) {
   apply_magnet();
   resolve_eating();
 
-  // Record the slime trail every few ticks.
-  if (upg_level(UPG_TRAIL) > 0 && ++s_trail_tick >= 3) {
+  // Record the slime trail every couple of ticks. The per-level cap is
+  // stable within a round (upgrades only change between rounds, and
+  // round_reset clears the buffer), so the ring stays consistent.
+  int trail_lvl = upg_level(UPG_TRAIL);
+  if (trail_lvl > 0 && ++s_trail_tick >= 2) {
+    int cap = 30 * (1 + trail_lvl);
     s_trail_tick = 0;
     s_trail[s_trail_head] = GPoint(TO_PX(s_player.x), TO_PX(s_player.y));
-    s_trail_head = (s_trail_head + 1) % TRAIL_MAX;
-    if (s_trail_len < TRAIL_MAX) {
+    s_trail_head = (s_trail_head + 1) % cap;
+    if (s_trail_len < cap) {
       s_trail_len++;
     }
   }
@@ -792,14 +803,40 @@ static void draw_hud(GContext *ctx) {
                      PBL_IF_ROUND_ELSE(GTextAlignmentCenter, GTextAlignmentLeft), NULL);
 }
 
-static void draw_center_text(GContext *ctx, const char *line1, const char *line2) {
+// Centered text on a black pill so menus stay readable over the busy world.
+static void draw_pill_line(GContext *ctx, const char *text, GFont font, int top) {
+  GSize sz = graphics_text_layout_get_content_size(
+      text, font, GRect(0, 0, PBL_DISPLAY_WIDTH, 100), GTextOverflowModeTrailingEllipsis,
+      GTextAlignmentCenter);
+  int w = sz.w + 22;
+  int h = sz.h + 4;
+  GRect pill = GRect((PBL_DISPLAY_WIDTH - w) / 2, top, w, h);
+  int rad = h / 2 > 14 ? 14 : h / 2;
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, pill, rad, GCornersAll);
+  graphics_context_set_stroke_color(ctx, GColorWhite);
+  graphics_draw_round_rect(ctx, pill, rad);
   graphics_context_set_text_color(ctx, GColorWhite);
-  graphics_draw_text(ctx, line1, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
-                     GRect(0, PBL_DISPLAY_HEIGHT / 2 - 46, PBL_DISPLAY_WIDTH, 32),
+  graphics_draw_text(ctx, text, font, GRect(0, top - 2, PBL_DISPLAY_WIDTH, h + 4),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-  graphics_draw_text(ctx, line2, fonts_get_system_font(FONT_KEY_GOTHIC_18),
-                     GRect(0, PBL_DISPLAY_HEIGHT / 2 - 10, PBL_DISPLAY_WIDTH, 70),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+}
+
+static void draw_center_text(GContext *ctx, const char *line1, const char *line2) {
+  draw_pill_line(ctx, line1, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
+                 PBL_DISPLAY_HEIGHT / 2 - 46);
+  draw_pill_line(ctx, line2, fonts_get_system_font(FONT_KEY_GOTHIC_18),
+                 PBL_DISPLAY_HEIGHT / 2 - 6);
+}
+
+// Title plus three option pills; top/middle/bottom map to UP/SELECT/DOWN.
+static void draw_menu(GContext *ctx, const char *title, const char *o0, const char *o1,
+                      const char *o2) {
+  GFont of = fonts_get_system_font(FONT_KEY_GOTHIC_18);
+  draw_pill_line(ctx, title, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
+                 PBL_DISPLAY_HEIGHT / 2 - 56);
+  draw_pill_line(ctx, o0, of, PBL_DISPLAY_HEIGHT / 2 - 18);
+  draw_pill_line(ctx, o1, of, PBL_DISPLAY_HEIGHT / 2 + 12);
+  draw_pill_line(ctx, o2, of, PBL_DISPLAY_HEIGHT / 2 + 42);
 }
 
 static void game_layer_update(Layer *layer, GContext *ctx) {
@@ -904,6 +941,19 @@ static void game_layer_update(Layer *layer, GContext *ctx) {
 #endif
   }
 
+  // Vampire siphon beams from grazed enemies into the player.
+  graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorRed, GColorWhite));
+  graphics_context_set_stroke_width(ctx, 3);
+  for (int i = 0; i < ENEMY_COUNT; i++) {
+    if (!s_vamp_link[i] || !s_enemies[i].alive) {
+      continue;
+    }
+    graphics_draw_line(
+        ctx, GPoint(TO_PX(s_player.x) - s_cam_x, TO_PX(s_player.y) - s_cam_y),
+        GPoint(TO_PX(s_enemies[i].x) - s_cam_x, TO_PX(s_enemies[i].y) - s_cam_y));
+  }
+  graphics_context_set_stroke_width(ctx, 1);
+
   // Player: on BW a black core distinguishes it from solid (dangerous)
   // enemies. While ghosting or hidden, just an outline.
   if (s_player.alive) {
@@ -953,20 +1003,22 @@ static void game_layer_update(Layer *layer, GContext *ctx) {
   if (s_state == STATE_PAUSED) {
     draw_center_text(ctx, "Paused", "SELECT to resume");
   } else if (s_state == STATE_UPGRADE) {
-    static char lines[72];
-    snprintf(lines, sizeof(lines), "UP: %s%s\nMID: %s%s\nDOWN: %s%s",
-             s_offers[0] == UPG_NONE ? "-" : UPG_NAMES[(int)s_offers[0]],
-             s_offers[0] != UPG_NONE && owned_index(s_offers[0]) >= 0 ? "+" : "",
-             s_offers[1] == UPG_NONE ? "-" : UPG_NAMES[(int)s_offers[1]],
-             s_offers[1] != UPG_NONE && owned_index(s_offers[1]) >= 0 ? "+" : "",
-             s_offers[2] == UPG_NONE ? "-" : UPG_NAMES[(int)s_offers[2]],
-             s_offers[2] != UPG_NONE && owned_index(s_offers[2]) >= 0 ? "+" : "");
-    draw_center_text(ctx, "Max size!", lines);
+    // Level-ups show the level you'd reach, e.g. "Magnet 2".
+    static char o[3][16];
+    for (int k = 0; k < 3; k++) {
+      int id = s_offers[k];
+      if (id == UPG_NONE) {
+        snprintf(o[k], sizeof(o[k]), "-");
+      } else if (owned_index(id) >= 0) {
+        snprintf(o[k], sizeof(o[k]), "%s %d", UPG_NAMES[id], upg_level(id) + 1);
+      } else {
+        snprintf(o[k], sizeof(o[k]), "%s", UPG_NAMES[id]);
+      }
+    }
+    draw_menu(ctx, "Max size!", o[0], o[1], o[2]);
   } else if (s_state == STATE_REPLACE) {
-    static char lines[72];
-    snprintf(lines, sizeof(lines), "UP: %s\nMID: %s\nDOWN: %s",
-             UPG_NAMES[(int)s_owned[0]], UPG_NAMES[(int)s_owned[1]], UPG_NAMES[(int)s_owned[2]]);
-    draw_center_text(ctx, "Drop one:", lines);
+    draw_menu(ctx, "Drop one:", UPG_NAMES[(int)s_owned[0]], UPG_NAMES[(int)s_owned[1]],
+              UPG_NAMES[(int)s_owned[2]]);
   } else if (s_state == STATE_GAME_OVER) {
     static char over[40];
     snprintf(over, sizeof(over), "Score: %d\nSELECT to restart", s_score);
