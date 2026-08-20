@@ -6,6 +6,10 @@
 
 #define TICK_MS 33  // ~30 fps
 
+// Testing aid: start at the upgrade screen instead of in the game.
+// Set to 0 for release builds.
+#define DEBUG_START_AT_UPGRADE 1
+
 // World is larger than the screen; the camera follows the player.
 #define WORLD_W 600
 #define WORLD_H 600
@@ -1107,6 +1111,10 @@ static void init(void) {
   accel_service_set_sampling_rate(ACCEL_SAMPLING_25HZ);
 
   game_reset();
+#if DEBUG_START_AT_UPGRADE
+  make_offers();
+  s_state = STATE_UPGRADE;
+#endif
   light_enable(true);
   s_timer = app_timer_register(TICK_MS, game_tick, NULL);
 }
