@@ -42,8 +42,29 @@
 typedef enum {
   STATE_RUNNING,
   STATE_PAUSED,
+  STATE_UPGRADE,  // player hit MAX_RADIUS; picking an upgrade for the next round
+  STATE_REPLACE,  // all 3 slots full; choosing which owned upgrade to drop
   STATE_GAME_OVER,
 } GameState;
+
+// The upgrade pool. Actives are triggered with UP/DOWN during play, so at
+// most 2 can be owned at once; passives just work.
+typedef enum {
+  UPG_DASH,     // active: burst of speed, costs mass
+  UPG_GHOST,    // active: briefly untouchable (and can't eat enemies)
+  UPG_FREEZE,   // active: enemies stop moving for a moment
+  UPG_MAGNET,   // passive: nearby food drifts toward you
+  UPG_VAMPIRE,  // passive: grazing a bigger enemy siphons its mass
+  UPG_CAMO,     // passive: enemies can't see you while you hold still
+  UPG_TRAIL,    // passive: you leave a trail that slows enemies crossing it
+  UPG_MITOSIS,  // passive: eaten enemies burst into food pellets
+  UPG_VIRUS,    // passive: spiky viruses roam that pop enemies, not you
+  UPG_COUNT,
+} UpgradeId;
+
+#define UPG_NONE (-1)
+#define MAX_OWNED 3
+#define MAX_UPG_LEVEL 3
 
 typedef struct {
   int32_t x, y;   // fixed point, world coordinates
@@ -67,6 +88,43 @@ static Cell s_enemies[ENEMY_COUNT];
 static Food s_food[FOOD_COUNT];
 static int s_score;
 static int32_t s_cam_x, s_cam_y;  // top-left of camera, px
+
+// Roguelite loop: reaching MAX_RADIUS ends the round; the player picks one
+// upgrade (max 3 owned, repeat picks level up), shrinks back to start size
+// and plays on against faster enemies.
+static int s_level;  // current round, 1-based
+static int8_t s_owned[MAX_OWNED];
+static int8_t s_owned_lvl[MAX_OWNED];
+static int8_t s_offers[3];  // UpgradeId per button: UP, SELECT, DOWN
+static int8_t s_pending;    // new upgrade awaiting a slot in STATE_REPLACE
+
+static const char *UPG_NAMES[UPG_COUNT] = {
+    "Dash", "Ghost", "Freeze", "Magnet", "Vampire", "Camo", "Trail", "Mitosis", "Virus",
+};
+static const bool UPG_IS_ACTIVE[UPG_COUNT] = {true, true, true, false, false,
+                                              false, false, false, false};
+
+// Active-ability timers, in ticks. *_ticks = time left while in effect,
+// *_cd = cooldown until usable again.
+static int16_t s_dash_ticks, s_dash_cd;
+static int16_t s_ghost_ticks, s_ghost_cd;
+static int16_t s_freeze_ticks, s_freeze_cd;
+static bool s_camo_hidden;
+
+// Extra food spawned by Mitosis; does not respawn when eaten.
+#define MITOSIS_MAX 10
+static Food s_mfood[MITOSIS_MAX];
+
+// Viruses pop enemies that touch them; the player (who owns the upgrade)
+// is immune.
+#define VIRUS_MAX 4
+#define VIRUS_RADIUS 7
+static Food s_virus[VIRUS_MAX];
+
+// Trail: recent player positions in world px, ring buffer.
+#define TRAIL_MAX 24
+static GPoint s_trail[TRAIL_MAX];
+static uint8_t s_trail_len, s_trail_head, s_trail_tick;
 
 // --- helpers ---------------------------------------------------------------
 
@@ -131,6 +189,100 @@ static void grow(Cell *c, int32_t eaten_mass) {
   c->r = (int16_t)isqrt32(c->mass);
 }
 
+// --- upgrades ----------------------------------------------------------------
+
+static int owned_index(int id) {
+  for (int i = 0; i < MAX_OWNED; i++) {
+    if (s_owned[i] == id) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// 0 if not owned, else 1..MAX_UPG_LEVEL.
+static int upg_level(int id) {
+  int idx = owned_index(id);
+  return idx < 0 ? 0 : s_owned_lvl[idx];
+}
+
+static int actives_owned(void) {
+  int n = 0;
+  for (int i = 0; i < MAX_OWNED; i++) {
+    if (s_owned[i] != UPG_NONE && UPG_IS_ACTIVE[(int)s_owned[i]]) {
+      n++;
+    }
+  }
+  return n;
+}
+
+// UP triggers the first owned active (slot 0), DOWN the second (slot 1).
+static int active_in_slot(int slot) {
+  int seen = 0;
+  for (int i = 0; i < MAX_OWNED; i++) {
+    int id = s_owned[i];
+    if (id != UPG_NONE && UPG_IS_ACTIVE[id]) {
+      if (seen == slot) {
+        return id;
+      }
+      seen++;
+    }
+  }
+  return UPG_NONE;
+}
+
+static bool player_hidden(void) {
+  return s_ghost_ticks > 0 || s_camo_hidden;
+}
+
+static void trigger_active(int id) {
+  int lvl = upg_level(id);
+  switch (id) {
+    case UPG_DASH:
+      if (s_dash_cd == 0) {
+        // Costs 10/8/6% of current mass, but never below start size.
+        int32_t cost = s_player.mass * (12 - 2 * lvl) / 100;
+        int32_t floor_mass = PLAYER_START_RADIUS * PLAYER_START_RADIUS;
+        if (s_player.mass - cost < floor_mass) {
+          cost = s_player.mass - floor_mass;
+        }
+        if (cost > 0) {
+          grow(&s_player, -cost);
+        }
+        s_dash_ticks = 8;
+        s_dash_cd = 105 - 15 * lvl;
+      }
+      break;
+    case UPG_GHOST:
+      if (s_ghost_cd == 0) {
+        s_ghost_ticks = 30 + 15 * lvl;
+        s_ghost_cd = 240 - 30 * lvl;
+      }
+      break;
+    case UPG_FREEZE:
+      if (s_freeze_cd == 0) {
+        s_freeze_ticks = 45 + 15 * lvl;
+        s_freeze_cd = 300 - 30 * lvl;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+static bool active_ready(int id) {
+  switch (id) {
+    case UPG_DASH:
+      return s_dash_cd == 0;
+    case UPG_GHOST:
+      return s_ghost_cd == 0;
+    case UPG_FREEZE:
+      return s_freeze_cd == 0;
+    default:
+      return false;
+  }
+}
+
 // --- spawning ---------------------------------------------------------------
 
 static void spawn_food(Food *f) {
@@ -167,13 +319,14 @@ static void spawn_enemy(Cell *e) {
   e->alive = true;
 }
 
-static void game_reset(void) {
+// Starts a round: player back to start size, fresh food and enemies.
+// Score and upgrades persist; game_reset() clears those for a new game.
+static void round_reset(void) {
   s_player.x = TO_FP(WORLD_W / 2);
   s_player.y = TO_FP(WORLD_H / 2);
   s_player.r = PLAYER_START_RADIUS;
   s_player.mass = PLAYER_START_RADIUS * PLAYER_START_RADIUS;
   s_player.alive = true;
-  s_score = 0;
 
   for (int i = 0; i < FOOD_COUNT; i++) {
     spawn_food(&s_food[i]);
@@ -181,7 +334,102 @@ static void game_reset(void) {
   for (int i = 0; i < ENEMY_COUNT; i++) {
     spawn_enemy(&s_enemies[i]);
   }
+
+  s_dash_ticks = s_dash_cd = 0;
+  s_ghost_ticks = s_ghost_cd = 0;
+  s_freeze_ticks = s_freeze_cd = 0;
+  s_camo_hidden = false;
+  s_trail_len = s_trail_head = s_trail_tick = 0;
+  for (int i = 0; i < MITOSIS_MAX; i++) {
+    s_mfood[i].alive = false;
+  }
+  int viruses = upg_level(UPG_VIRUS) > 0 ? upg_level(UPG_VIRUS) + 1 : 0;
+  for (int i = 0; i < VIRUS_MAX; i++) {
+    if (i < viruses) {
+      spawn_food(&s_virus[i]);
+    } else {
+      s_virus[i].alive = false;
+    }
+  }
+
   s_state = STATE_RUNNING;
+}
+
+static void game_reset(void) {
+  s_score = 0;
+  s_level = 1;
+  for (int i = 0; i < MAX_OWNED; i++) {
+    s_owned[i] = UPG_NONE;
+    s_owned_lvl[i] = 0;
+  }
+  s_pending = UPG_NONE;
+  round_reset();
+}
+
+// Build 3 distinct offers: level-ups of owned upgrades plus unowned ones.
+// A new active is only offered while fewer than 2 are owned, since only
+// UP and DOWN can trigger them.
+static void make_offers(void) {
+  int cand[UPG_COUNT];
+  int n = 0;
+  for (int id = 0; id < UPG_COUNT; id++) {
+    int idx = owned_index(id);
+    if (idx >= 0) {
+      if (s_owned_lvl[idx] < MAX_UPG_LEVEL) {
+        cand[n++] = id;
+      }
+    } else if (!UPG_IS_ACTIVE[id] || actives_owned() < 2) {
+      cand[n++] = id;
+    }
+  }
+  for (int k = 0; k < 3; k++) {
+    if (n > 0) {
+      int j = rand() % n;
+      s_offers[k] = (int8_t)cand[j];
+      cand[j] = cand[--n];
+    } else {
+      s_offers[k] = UPG_NONE;
+    }
+  }
+}
+
+static void next_round(void) {
+  s_level++;
+  round_reset();
+}
+
+static void pick_offer(int k) {
+  int id = s_offers[k];
+  if (id == UPG_NONE) {
+    return;
+  }
+  int idx = owned_index(id);
+  if (idx >= 0) {
+    s_owned_lvl[idx]++;
+    next_round();
+    return;
+  }
+  for (int i = 0; i < MAX_OWNED; i++) {
+    if (s_owned[i] == UPG_NONE) {
+      s_owned[i] = (int8_t)id;
+      s_owned_lvl[i] = 1;
+      next_round();
+      return;
+    }
+  }
+  // All 3 slots taken: pick which owned upgrade to drop.
+  s_pending = (int8_t)id;
+  s_state = STATE_REPLACE;
+}
+
+static void replace_slot(int k) {
+  if (s_pending == UPG_NONE) {
+    return;
+  }
+  s_owned[k] = s_pending;
+  s_owned_lvl[k] = 1;
+  s_pending = UPG_NONE;
+  next_round();
 }
 
 // --- simulation --------------------------------------------------------------
@@ -208,9 +456,33 @@ static void update_player(void) {
   if (ty > -TILT_DEADZONE && ty < TILT_DEADZONE) {
     ty = 0;
   }
+
+  // Camo: below a stillness threshold (looser with level) enemies lose you.
+  int camo_lvl = upg_level(UPG_CAMO);
+  int32_t atx = tx < 0 ? -tx : tx;
+  int32_t aty = ty < 0 ? -ty : ty;
+  s_camo_hidden = camo_lvl > 0 && atx < 60 * camo_lvl && aty < 60 * camo_lvl;
+
   int32_t vx = tx * SPEED_COEF / (SPEED_BASE + s_player.r);
   int32_t vy = ty * SPEED_COEF / (SPEED_BASE + s_player.r);
+  if (s_dash_ticks > 0) {
+    vx *= 3;
+    vy *= 3;
+  }
   move_cell(&s_player, vx, vy);
+}
+
+static bool on_trail(const Cell *c) {
+  int32_t cx = TO_PX(c->x);
+  int32_t cy = TO_PX(c->y);
+  for (int i = 0; i < s_trail_len; i++) {
+    int32_t dx = cx - s_trail[i].x;
+    int32_t dy = cy - s_trail[i].y;
+    if (dx * dx + dy * dy <= 8 * 8) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static void update_enemy(Cell *e) {
@@ -237,7 +509,7 @@ static void update_enemy(Cell *e) {
   }
 
   // Chasing the player beats food if the player is edible and nearby.
-  if (s_player.alive && can_eat(e->r, s_player.r)) {
+  if (s_player.alive && !player_hidden() && can_eat(e->r, s_player.r)) {
     int32_t dx = TO_PX(s_player.x - ex);
     int32_t dy = TO_PX(s_player.y - ey);
     int32_t d2 = dx * dx + dy * dy;
@@ -256,7 +528,7 @@ static void update_enemy(Cell *e) {
   }
 
   // Fleeing a dangerous player overrides everything.
-  if (s_player.alive && can_eat(s_player.r, e->r)) {
+  if (s_player.alive && !player_hidden() && can_eat(s_player.r, e->r)) {
     int32_t dx = TO_PX(ex - s_player.x);
     int32_t dy = TO_PX(ey - s_player.y);
     if (dx * dx + dy * dy < 90 * 90) {
@@ -272,11 +544,63 @@ static void update_enemy(Cell *e) {
     return;
   }
 
-  // Enemies run at half the player's full-tilt speed for the same size.
-  int32_t speed = TILT_MAX * SPEED_COEF / (2 * (SPEED_BASE + e->r));
+  // Enemies run at half the player's full-tilt speed for the same size,
+  // gaining 5% per level up to 85%.
+  int32_t fac = 9 + s_level;
+  if (fac > 17) {
+    fac = 17;
+  }
+  int32_t speed = TILT_MAX * SPEED_COEF * fac / (20 * (SPEED_BASE + e->r));
+
+  // Crossing the player's slime trail is like wading through glue.
+  int trail_lvl = upg_level(UPG_TRAIL);
+  if (trail_lvl > 0 && on_trail(e)) {
+    speed = speed * (6 - trail_lvl) / 10;
+  }
   int32_t vx = dir_x * speed / mag;
   int32_t vy = dir_y * speed / mag;
   move_cell(e, vx, vy);
+}
+
+// Mitosis: an eaten enemy bursts into extra one-shot pellets.
+static void mitosis_burst(int32_t x, int32_t y) {
+  int lvl = upg_level(UPG_MITOSIS);
+  if (lvl == 0) {
+    return;
+  }
+  int want = 1 + lvl;
+  for (int i = 0; i < MITOSIS_MAX && want > 0; i++) {
+    if (s_mfood[i].alive) {
+      continue;
+    }
+    s_mfood[i].x = clamp32(x + TO_FP(rand_range(-24, 24)), TO_FP(4), TO_FP(WORLD_W - 4));
+    s_mfood[i].y = clamp32(y + TO_FP(rand_range(-24, 24)), TO_FP(4), TO_FP(WORLD_H - 4));
+    s_mfood[i].alive = true;
+    want--;
+  }
+}
+
+static void magnet_pull(Food *f) {
+  f->x += clamp32((s_player.x - f->x) / 16, -TO_FP(2), TO_FP(2));
+  f->y += clamp32((s_player.y - f->y) / 16, -TO_FP(2), TO_FP(2));
+}
+
+static void apply_magnet(void) {
+  int lvl = upg_level(UPG_MAGNET);
+  if (lvl == 0) {
+    return;
+  }
+  int32_t radius = 25 + 15 * lvl;
+  for (int i = 0; i < FOOD_COUNT; i++) {
+    if (s_food[i].alive && within_dist(s_food[i].x, s_food[i].y, s_player.x, s_player.y, radius)) {
+      magnet_pull(&s_food[i]);
+    }
+  }
+  for (int i = 0; i < MITOSIS_MAX; i++) {
+    if (s_mfood[i].alive && within_dist(s_mfood[i].x, s_mfood[i].y, s_player.x, s_player.y, radius)) {
+      magnet_pull(&s_mfood[i]);
+    }
+  }
 }
 
 static void resolve_eating(void) {
@@ -310,22 +634,78 @@ static void resolve_eating(void) {
     }
   }
 
-  // Player vs enemies.
-  for (int e = 0; e < ENEMY_COUNT; e++) {
-    Cell *en = &s_enemies[e];
-    if (!en->alive) {
+  // Mitosis pellets are one-shot: anyone can eat them, they don't respawn.
+  for (int i = 0; i < MITOSIS_MAX; i++) {
+    if (!s_mfood[i].alive) {
       continue;
     }
-    if (can_eat(s_player.r, en->r) && engulfs(&s_player, en)) {
-      s_score += en->r;
-      grow(&s_player, en->mass);
-      spawn_enemy(en);
-    } else if (can_eat(en->r, s_player.r) && engulfs(en, &s_player)) {
-      s_player.alive = false;
-      s_state = STATE_GAME_OVER;
-      light_enable(false);
-      vibes_double_pulse();
-      return;
+    if (touches_food(&s_player, &s_mfood[i])) {
+      s_mfood[i].alive = false;
+      grow(&s_player, FOOD_VALUE);
+      s_score += 1;
+      continue;
+    }
+    for (int e = 0; e < ENEMY_COUNT; e++) {
+      if (s_enemies[e].alive && touches_food(&s_enemies[e], &s_mfood[i])) {
+        s_mfood[i].alive = false;
+        grow(&s_enemies[e], FOOD_VALUE);
+        break;
+      }
+    }
+  }
+
+  // Player vs enemies. While ghosting the player is out of phase: nothing
+  // can eat them and they can't eat (food is still fine).
+  if (s_ghost_ticks == 0) {
+    for (int e = 0; e < ENEMY_COUNT; e++) {
+      Cell *en = &s_enemies[e];
+      if (!en->alive) {
+        continue;
+      }
+      if (can_eat(s_player.r, en->r) && engulfs(&s_player, en)) {
+        s_score += en->r;
+        grow(&s_player, en->mass);
+        mitosis_burst(en->x, en->y);
+        spawn_enemy(en);
+      } else if (can_eat(en->r, s_player.r) && engulfs(en, &s_player)) {
+        s_player.alive = false;
+        s_state = STATE_GAME_OVER;
+        light_enable(false);
+        vibes_double_pulse();
+        return;
+      } else if (upg_level(UPG_VAMPIRE) > 0 && can_eat(en->r, s_player.r) &&
+                 within_dist(en->x, en->y, s_player.x, s_player.y, en->r + s_player.r)) {
+        // Grazing (touching without being engulfed by) a bigger enemy
+        // siphons its mass, tick by tick.
+        int32_t sip = 2 * upg_level(UPG_VAMPIRE);
+        grow(en, -sip);
+        grow(&s_player, sip);
+      }
+    }
+  }
+
+  // Viruses pop enemies that touch them; the player is immune.
+  for (int v = 0; v < VIRUS_MAX; v++) {
+    if (!s_virus[v].alive) {
+      continue;
+    }
+    for (int e = 0; e < ENEMY_COUNT; e++) {
+      Cell *en = &s_enemies[e];
+      if (!en->alive) {
+        continue;
+      }
+      if (within_dist(s_virus[v].x, s_virus[v].y, en->x, en->y, en->r + VIRUS_RADIUS)) {
+        int32_t floor_mass = 16;
+        int32_t loss = en->mass / 2;
+        if (en->mass - loss < floor_mass) {
+          loss = en->mass - floor_mass;
+        }
+        if (loss > 0) {
+          grow(en, -loss);
+        }
+        spawn_food(&s_virus[v]);  // relocate so it can't camp on one enemy
+        break;
+      }
     }
   }
 
@@ -351,13 +731,40 @@ static void game_tick(void *context) {
   if (s_state != STATE_RUNNING) {
     return;
   }
+  if (s_dash_ticks > 0) s_dash_ticks--;
+  if (s_dash_cd > 0) s_dash_cd--;
+  if (s_ghost_ticks > 0) s_ghost_ticks--;
+  if (s_ghost_cd > 0) s_ghost_cd--;
+  if (s_freeze_ticks > 0) s_freeze_ticks--;
+  if (s_freeze_cd > 0) s_freeze_cd--;
+
   update_player();
-  for (int i = 0; i < ENEMY_COUNT; i++) {
-    if (s_enemies[i].alive) {
-      update_enemy(&s_enemies[i]);
+  if (s_freeze_ticks == 0) {
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+      if (s_enemies[i].alive) {
+        update_enemy(&s_enemies[i]);
+      }
     }
   }
+  apply_magnet();
   resolve_eating();
+
+  // Record the slime trail every few ticks.
+  if (upg_level(UPG_TRAIL) > 0 && ++s_trail_tick >= 3) {
+    s_trail_tick = 0;
+    s_trail[s_trail_head] = GPoint(TO_PX(s_player.x), TO_PX(s_player.y));
+    s_trail_head = (s_trail_head + 1) % TRAIL_MAX;
+    if (s_trail_len < TRAIL_MAX) {
+      s_trail_len++;
+    }
+  }
+
+  // Round won: hit max size, pick an upgrade for the next round.
+  if (s_state == STATE_RUNNING && s_player.mass >= MAX_RADIUS * MAX_RADIUS) {
+    make_offers();
+    s_state = STATE_UPGRADE;
+    vibes_short_pulse();
+  }
 
   // Camera follows the player. On round displays it stays centered on the
   // player unconditionally — clamping to the world edge would push the
@@ -377,7 +784,7 @@ static void game_tick(void *context) {
 
 static void draw_hud(GContext *ctx) {
   static char buf[24];
-  snprintf(buf, sizeof(buf), "Score: %d", s_score);
+  snprintf(buf, sizeof(buf), "L%d Score: %d", s_level, s_score);
   graphics_context_set_text_color(ctx, GColorWhite);
   // Centered on round displays so the circular bezel doesn't clip it.
   graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
@@ -388,10 +795,10 @@ static void draw_hud(GContext *ctx) {
 static void draw_center_text(GContext *ctx, const char *line1, const char *line2) {
   graphics_context_set_text_color(ctx, GColorWhite);
   graphics_draw_text(ctx, line1, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
-                     GRect(0, PBL_DISPLAY_HEIGHT / 2 - 40, PBL_DISPLAY_WIDTH, 32),
+                     GRect(0, PBL_DISPLAY_HEIGHT / 2 - 46, PBL_DISPLAY_WIDTH, 32),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
   graphics_draw_text(ctx, line2, fonts_get_system_font(FONT_KEY_GOTHIC_18),
-                     GRect(0, PBL_DISPLAY_HEIGHT / 2 - 4, PBL_DISPLAY_WIDTH, 44),
+                     GRect(0, PBL_DISPLAY_HEIGHT / 2 - 10, PBL_DISPLAY_WIDTH, 70),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 }
 
@@ -413,17 +820,47 @@ static void game_layer_update(Layer *layer, GContext *ctx) {
   graphics_context_set_stroke_color(ctx, GColorLightGray);
   graphics_draw_rect(ctx, GRect(-s_cam_x, -s_cam_y, WORLD_W, WORLD_H));
 
-  // Food.
+  // Slime trail.
+  if (upg_level(UPG_TRAIL) > 0) {
+    graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorMayGreen, GColorWhite));
+    for (int i = 0; i < s_trail_len; i++) {
+      GPoint p = GPoint(s_trail[i].x - s_cam_x, s_trail[i].y - s_cam_y);
+      if (p.x < -2 || p.x > PBL_DISPLAY_WIDTH + 2 || p.y < -2 || p.y > PBL_DISPLAY_HEIGHT + 2) {
+        continue;
+      }
+      graphics_fill_circle(ctx, p, 1);
+    }
+  }
+
+  // Food, plus one-shot mitosis pellets in the same style.
   graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorYellow, GColorWhite));
-  for (int i = 0; i < FOOD_COUNT; i++) {
-    if (!s_food[i].alive) {
+  for (int i = 0; i < FOOD_COUNT + MITOSIS_MAX; i++) {
+    const Food *f = i < FOOD_COUNT ? &s_food[i] : &s_mfood[i - FOOD_COUNT];
+    if (!f->alive) {
       continue;
     }
-    GPoint p = GPoint(TO_PX(s_food[i].x) - s_cam_x, TO_PX(s_food[i].y) - s_cam_y);
+    GPoint p = GPoint(TO_PX(f->x) - s_cam_x, TO_PX(f->y) - s_cam_y);
     if (p.x < -4 || p.x > PBL_DISPLAY_WIDTH + 4 || p.y < -4 || p.y > PBL_DISPLAY_HEIGHT + 4) {
       continue;
     }
     graphics_fill_circle(ctx, p, FOOD_RADIUS);
+  }
+
+  // Viruses: spiky rings, harmless to the player.
+  graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorPurple, GColorWhite));
+  for (int i = 0; i < VIRUS_MAX; i++) {
+    if (!s_virus[i].alive) {
+      continue;
+    }
+    GPoint p = GPoint(TO_PX(s_virus[i].x) - s_cam_x, TO_PX(s_virus[i].y) - s_cam_y);
+    if (p.x < -12 || p.x > PBL_DISPLAY_WIDTH + 12 || p.y < -12 || p.y > PBL_DISPLAY_HEIGHT + 12) {
+      continue;
+    }
+    graphics_draw_circle(ctx, p, VIRUS_RADIUS);
+    graphics_draw_line(ctx, GPoint(p.x - VIRUS_RADIUS, p.y), GPoint(p.x - VIRUS_RADIUS - 3, p.y));
+    graphics_draw_line(ctx, GPoint(p.x + VIRUS_RADIUS, p.y), GPoint(p.x + VIRUS_RADIUS + 3, p.y));
+    graphics_draw_line(ctx, GPoint(p.x, p.y - VIRUS_RADIUS), GPoint(p.x, p.y - VIRUS_RADIUS - 3));
+    graphics_draw_line(ctx, GPoint(p.x, p.y + VIRUS_RADIUS), GPoint(p.x, p.y + VIRUS_RADIUS + 3));
   }
 
   // Enemies, colored by threat: red can eat you, green you can eat.
@@ -467,23 +904,69 @@ static void game_layer_update(Layer *layer, GContext *ctx) {
 #endif
   }
 
-  // Player: on BW a black core distinguishes it from solid (dangerous) enemies.
+  // Player: on BW a black core distinguishes it from solid (dangerous)
+  // enemies. While ghosting or hidden, just an outline.
   if (s_player.alive) {
     GPoint p = GPoint(TO_PX(s_player.x) - s_cam_x, TO_PX(s_player.y) - s_cam_y);
-    graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorCyan, GColorWhite));
-    graphics_fill_circle(ctx, p, s_player.r);
-    graphics_context_set_stroke_color(ctx, GColorWhite);
-    graphics_draw_circle(ctx, p, s_player.r);
+    if (player_hidden()) {
+      graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorCyan, GColorWhite));
+      graphics_draw_circle(ctx, p, s_player.r);
+      graphics_draw_circle(ctx, p, s_player.r > 4 ? s_player.r - 3 : 1);
+    } else {
+      graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorCyan, GColorWhite));
+      graphics_fill_circle(ctx, p, s_player.r);
+      graphics_context_set_stroke_color(ctx, GColorWhite);
+      graphics_draw_circle(ctx, p, s_player.r);
 #ifndef PBL_COLOR
-    graphics_context_set_fill_color(ctx, GColorBlack);
-    graphics_fill_circle(ctx, p, s_player.r / 3);
+      graphics_context_set_fill_color(ctx, GColorBlack);
+      graphics_fill_circle(ctx, p, s_player.r / 3);
 #endif
+    }
   }
 
   draw_hud(ctx);
 
+  // Owned actives sit next to their button: slot 0 by UP (top right),
+  // slot 1 by DOWN (bottom right). Filled = ready, hollow = cooling down.
+  for (int slot = 0; slot < 2; slot++) {
+    int id = active_in_slot(slot);
+    if (id == UPG_NONE) {
+      continue;
+    }
+    int x = PBL_DISPLAY_WIDTH - PBL_IF_ROUND_ELSE(26, 13);
+    int y = slot == 0 ? 44 : PBL_DISPLAY_HEIGHT - 44;
+    char letter[2] = {UPG_NAMES[id][0], '\0'};
+    if (active_ready(id)) {
+      graphics_context_set_fill_color(ctx, GColorWhite);
+      graphics_fill_circle(ctx, GPoint(x, y), 9);
+      graphics_context_set_text_color(ctx, GColorBlack);
+    } else {
+      graphics_context_set_stroke_color(ctx, GColorWhite);
+      graphics_draw_circle(ctx, GPoint(x, y), 9);
+      graphics_context_set_text_color(ctx, GColorWhite);
+    }
+    graphics_draw_text(ctx, letter, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                       GRect(x - 8, y - 10, 16, 16), GTextOverflowModeTrailingEllipsis,
+                       GTextAlignmentCenter, NULL);
+  }
+
   if (s_state == STATE_PAUSED) {
     draw_center_text(ctx, "Paused", "SELECT to resume");
+  } else if (s_state == STATE_UPGRADE) {
+    static char lines[72];
+    snprintf(lines, sizeof(lines), "UP: %s%s\nMID: %s%s\nDOWN: %s%s",
+             s_offers[0] == UPG_NONE ? "-" : UPG_NAMES[(int)s_offers[0]],
+             s_offers[0] != UPG_NONE && owned_index(s_offers[0]) >= 0 ? "+" : "",
+             s_offers[1] == UPG_NONE ? "-" : UPG_NAMES[(int)s_offers[1]],
+             s_offers[1] != UPG_NONE && owned_index(s_offers[1]) >= 0 ? "+" : "",
+             s_offers[2] == UPG_NONE ? "-" : UPG_NAMES[(int)s_offers[2]],
+             s_offers[2] != UPG_NONE && owned_index(s_offers[2]) >= 0 ? "+" : "");
+    draw_center_text(ctx, "Max size!", lines);
+  } else if (s_state == STATE_REPLACE) {
+    static char lines[72];
+    snprintf(lines, sizeof(lines), "UP: %s\nMID: %s\nDOWN: %s",
+             UPG_NAMES[(int)s_owned[0]], UPG_NAMES[(int)s_owned[1]], UPG_NAMES[(int)s_owned[2]]);
+    draw_center_text(ctx, "Drop one:", lines);
   } else if (s_state == STATE_GAME_OVER) {
     static char over[40];
     snprintf(over, sizeof(over), "Score: %d\nSELECT to restart", s_score);
@@ -501,6 +984,12 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
     case STATE_PAUSED:
       s_state = STATE_RUNNING;
       break;
+    case STATE_UPGRADE:
+      pick_offer(1);
+      break;
+    case STATE_REPLACE:
+      replace_slot(1);
+      break;
     case STATE_GAME_OVER:
       game_reset();
       break;
@@ -510,8 +999,30 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
   layer_mark_dirty(s_game_layer);
 }
 
+// UP and DOWN trigger active abilities during play and pick menu entries
+// on the upgrade/replace screens.
+static void updown_click_handler(ClickRecognizerRef recognizer, void *context) {
+  int slot = click_recognizer_get_button_id(recognizer) == BUTTON_ID_UP ? 0 : 1;
+  if (s_state == STATE_RUNNING) {
+    int id = active_in_slot(slot);
+    if (id != UPG_NONE) {
+      trigger_active(id);
+    }
+    return;  // no redraw needed; the next tick draws the effect
+  }
+  if (s_state == STATE_UPGRADE) {
+    pick_offer(slot == 0 ? 0 : 2);
+  } else if (s_state == STATE_REPLACE) {
+    replace_slot(slot == 0 ? 0 : 2);
+  }
+  light_enable(s_state == STATE_RUNNING);
+  layer_mark_dirty(s_game_layer);
+}
+
 static void click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
+  window_single_click_subscribe(BUTTON_ID_UP, updown_click_handler);
+  window_single_click_subscribe(BUTTON_ID_DOWN, updown_click_handler);
 }
 
 // --- app lifecycle --------------------------------------------------------------
