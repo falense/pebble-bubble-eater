@@ -24,6 +24,21 @@ rule the arena.
 - **Select**: pause/resume, or restart after being eaten.
 - **Back**: quit.
 
+### Rounds and upgrades
+
+Reaching max size wins the round. You pick one of three upgrades, shrink back
+to starting size, and play on against faster enemies. You can hold at most
+three upgrades; picking one you already own levels it up (max level 3), and
+when all slots are full you choose which one to drop.
+
+- **Actives** (triggered with Up/Down during play, at most two held):
+  **Dash** burns mass for a burst of speed, **Ghost** makes you briefly
+  untouchable, **Freeze** stops enemies for a moment.
+- **Passives**: **Magnet** pulls nearby food in, **Vampire** siphons mass from
+  bigger enemies you graze, **Camo** hides you while you hold still, **Trail**
+  slows enemies crossing your wake, **Mitosis** bursts eaten enemies into food,
+  **Virus** spawns spiky viruses that pop enemies but not you.
+
 ## Implementation notes
 
 - Pure C against the Pebble SDK, no external resources or libraries.

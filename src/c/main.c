@@ -8,7 +8,7 @@
 
 // Testing aid: start at the upgrade screen instead of in the game.
 // Set to 0 for release builds.
-#define DEBUG_START_AT_UPGRADE 1
+#define DEBUG_START_AT_UPGRADE 0
 
 // World is larger than the screen; the camera follows the player.
 #define WORLD_W 600
